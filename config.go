@@ -10,233 +10,241 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path"
-	"strings"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v2"
 )
 
+type serverConfig struct {
+	ListenAddress string   `yaml:"listen_address"`
+	HostKeys      []string `yaml:"host_keys"`
+}
+
+type loggingConfig struct {
+	File       string `yaml:"file"`
+	JSON       bool   `yaml:"json"`
+	Timestamps bool   `yaml:"timestamps"`
+	Debug      bool   `yaml:"debug"`
+}
+
+type commonAuthConfig struct {
+	Enabled  bool `yaml:"enabled"`
+	Accepted bool `yaml:"accepted"`
+}
+
+type keyboardInteractiveAuthQuestion struct {
+	Text string `yaml:"text"`
+	Echo bool   `yaml:"echo"`
+}
+
+type keyboardInteractiveAuthConfig struct {
+	commonAuthConfig `yaml:",inline"`
+	Instruction      string                            `yaml:"instruction"`
+	Questions        []keyboardInteractiveAuthQuestion `yaml:"questions"`
+}
+
+type authConfig struct {
+	MaxTries                int                           `yaml:"max_tries"`
+	NoAuth                  bool                          `yaml:"no_auth"`
+	PasswordAuth            commonAuthConfig              `yaml:"password_auth"`
+	PublicKeyAuth           commonAuthConfig              `yaml:"public_key_auth"`
+	KeyboardInteractiveAuth keyboardInteractiveAuthConfig `yaml:"keyboard_interactive_auth"`
+}
+
+type sshProtoConfig struct {
+	Version        string   `yaml:"version"`
+	Banner         string   `yaml:"banner"`
+	RekeyThreshold uint64   `yaml:"rekey_threshold"`
+	KeyExchanges   []string `yaml:"key_exchanges"`
+	Ciphers        []string `yaml:"ciphers"`
+	MACs           []string `yaml:"macs"`
+}
+
 type config struct {
-	ListenAddress           string
-	LogFile                 string
-	JSONLogging             bool
-	RekeyThreshold          uint64
-	KeyExchanges            []string
-	Ciphers                 []string
-	MACs                    []string
-	HostKeys                []string
-	NoClientAuth            bool
-	MaxAuthTries            int
-	PasswordAuth            struct{ Enabled, Accepted bool }
-	PublicKeyAuth           struct{ Enabled, Accepted bool }
-	KeyboardInteractiveAuth struct {
-		Enabled, Accepted bool
-		Instruction       string
-		Questions         []struct {
-			Text string
-			Echo bool
-		}
-	}
-	ServerVersion string
-	Banner        string
+	Server   serverConfig   `yaml:"server"`
+	Logging  loggingConfig  `yaml:"logging"`
+	Auth     authConfig     `yaml:"auth"`
+	SSHProto sshProtoConfig `yaml:"ssh_proto"`
+
+	parsedHostKeys []ssh.Signer
+	sshConfig      *ssh.ServerConfig
+	logFileHandle  io.WriteCloser
 }
 
-func (cfg config) createSSHServerConfig() (*ssh.ServerConfig, error) {
-	sshServerConfig := &ssh.ServerConfig{
-		Config: ssh.Config{
-			RekeyThreshold: cfg.RekeyThreshold,
-			KeyExchanges:   cfg.KeyExchanges,
-			Ciphers:        cfg.Ciphers,
-			MACs:           cfg.MACs,
-		},
-		NoClientAuth: cfg.NoClientAuth,
-		MaxAuthTries: cfg.MaxAuthTries,
-		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
-			getLogEntry(conn).WithFields(logrus.Fields{
-				"method":  method,
-				"success": err == nil,
-			}).Infoln("Client attempted to authenticate")
-		},
-		ServerVersion: cfg.ServerVersion,
-	}
-	if cfg.PasswordAuth.Enabled {
-		sshServerConfig.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			getLogEntry(conn).WithFields(logrus.Fields{
-				"password": string(password),
-				"success":  cfg.PasswordAuth.Accepted,
-			}).Infoln("Password authentication attempted")
-			if !cfg.PasswordAuth.Accepted {
-				return nil, errors.New("")
-			}
-			return nil, nil
-		}
-	}
-	if cfg.PublicKeyAuth.Enabled {
-		sshServerConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			getLogEntry(conn).WithFields(logrus.Fields{
-				"public_key_fingerprint": ssh.FingerprintSHA256(key),
-				"success":                cfg.PublicKeyAuth.Accepted,
-			}).Infoln("Public key authentication attempted")
-			if !cfg.PublicKeyAuth.Accepted {
-				return nil, errors.New("")
-			}
-			return nil, nil
-		}
-	}
-	if cfg.KeyboardInteractiveAuth.Enabled {
-		sshServerConfig.KeyboardInteractiveCallback = func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-			var questions []string
-			var echos []bool
-			for _, question := range cfg.KeyboardInteractiveAuth.Questions {
-				questions = append(questions, question.Text)
-				echos = append(echos, question.Echo)
-			}
-			answers, err := client(conn.User(), cfg.KeyboardInteractiveAuth.Instruction, questions, echos)
-			if err != nil {
-				log.Println("Failed to process keyboard interactive authentication:", err)
-				return nil, errors.New("")
-			}
-			getLogEntry(conn).WithFields(logrus.Fields{
-				"answers": strings.Join(answers, ", "),
-				"success": cfg.KeyboardInteractiveAuth.Accepted,
-			}).Infoln("Keyboard interactive authentication attempted")
-			if !cfg.KeyboardInteractiveAuth.Accepted {
-				return nil, errors.New("")
-			}
-			return nil, nil
-		}
-	}
-	if cfg.Banner != "" {
-		sshServerConfig.BannerCallback = func(conn ssh.ConnMetadata) string { return cfg.Banner }
-	}
-	for _, hostKeyFileName := range cfg.HostKeys {
-		hostKeyBytes, err := ioutil.ReadFile(hostKeyFileName)
-		if err != nil {
-			return nil, err
-		}
-		signer, err := ssh.ParsePrivateKey(hostKeyBytes)
-		if err != nil {
-			return nil, err
-		}
-		sshServerConfig.AddHostKey(signer)
-	}
-	return sshServerConfig, nil
+func getDefaultConfig() *config {
+	cfg := &config{}
+	cfg.Server.ListenAddress = "127.0.0.1:2022"
+	cfg.Logging.Timestamps = true
+	cfg.Auth.PasswordAuth.Enabled = true
+	cfg.Auth.PasswordAuth.Accepted = true
+	cfg.Auth.PublicKeyAuth.Enabled = true
+	cfg.SSHProto.Version = "SSH-2.0-sshesame"
+	cfg.SSHProto.Banner = "This is an SSH honeypot. Everything is logged and monitored."
+	return cfg
 }
 
-func (cfg config) setupLogging() (*os.File, error) {
-	var result *os.File
-	if cfg.LogFile != "" {
-		logFile, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, err
-		}
-		logrus.SetOutput(logFile)
-		result = logFile
-	} else {
-		logrus.SetOutput(os.Stdout)
-	}
-	if cfg.JSONLogging {
-		logrus.SetFormatter(&logrus.JSONFormatter{})
-	} else {
-		logrus.SetFormatter(&logrus.TextFormatter{})
-	}
-	return result, nil
-}
-
-type hostKeyType int
+type keySignature int
 
 const (
-	rsa_key hostKeyType = iota
+	rsa_key keySignature = iota
 	ecdsa_key
 	ed25519_key
 )
 
-func generateKey(fileName string, keyType hostKeyType) error {
-	if _, err := os.Stat(fileName); err != nil {
-		if !os.IsNotExist(err) {
-			return err
+func (signature keySignature) String() string {
+	switch signature {
+	case rsa_key:
+		return "rsa"
+	case ecdsa_key:
+		return "ecdsa"
+	case ed25519_key:
+		return "ed25519"
+	default:
+		return "unknown"
+	}
+}
+
+func generateKey(dataDir string, signature keySignature) (string, error) {
+	keyFile := path.Join(dataDir, fmt.Sprintf("host_%v_key", signature))
+	if _, err := os.Stat(keyFile); err == nil {
+		return keyFile, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	infoLogger.Printf("Host key %q not found, generating it", keyFile)
+	if _, err := os.Stat(path.Dir(keyFile)); os.IsNotExist(err) {
+		if err := os.MkdirAll(path.Dir(keyFile), 0755); err != nil {
+			return "", err
 		}
-		log.Println("Host key", fileName, "not found, generating it")
-		if _, err := os.Stat(path.Dir(fileName)); os.IsNotExist(err) {
-			if err := os.MkdirAll(path.Dir(fileName), 0755); err != nil {
-				return err
-			}
-		}
-		var key interface{}
-		switch keyType {
-		case rsa_key:
-			key, err = rsa.GenerateKey(rand.Reader, 3072)
-		case ecdsa_key:
-			key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		case ed25519_key:
-			_, key, err = ed25519.GenerateKey(rand.Reader)
-		default:
-			err = errors.New("unsupported key type")
-		}
+	}
+	var key interface{}
+	err := errors.New("unsupported key type")
+	switch signature {
+	case rsa_key:
+		key, err = rsa.GenerateKey(rand.Reader, 3072)
+	case ecdsa_key:
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	case ed25519_key:
+		_, key, err = ed25519.GenerateKey(rand.Reader)
+	}
+	if err != nil {
+		return "", err
+	}
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return "", err
+	}
+	if err := ioutil.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}), 0600); err != nil {
+		return "", err
+	}
+	return keyFile, nil
+}
+
+func loadKey(keyFile string) (ssh.Signer, error) {
+	keyBytes, err := ioutil.ReadFile(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.ParsePrivateKey(keyBytes)
+}
+
+func (cfg *config) setDefaultHostKeys(dataDir string, signatures []keySignature) error {
+	for _, signature := range signatures {
+		keyFile, err := generateKey(dataDir, signature)
 		if err != nil {
 			return err
 		}
-		keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
-		if err != nil {
-			return err
-		}
-		if err := ioutil.WriteFile(fileName, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}), 0600); err != nil {
-			return err
-		}
+		cfg.Server.HostKeys = append(cfg.Server.HostKeys, keyFile)
 	}
 	return nil
 }
 
-func getConfig(fileName string, dataDir string) (*config, error) {
-	result := &config{
-		ListenAddress: "127.0.0.1:2022",
-		ServerVersion: "SSH-2.0-sshesame",
-		Banner:        "This is an SSH honeypot. Everything is logged and monitored.\n",
-	}
-	result.PasswordAuth.Enabled = true
-	result.PasswordAuth.Accepted = true
-	result.PublicKeyAuth.Enabled = true
-	result.PublicKeyAuth.Accepted = false
-
-	var configBytes []byte
-	var err error
-	if fileName != "" {
-		configBytes, err = ioutil.ReadFile(fileName)
+func (cfg *config) parseHostKeys() error {
+	for _, keyFile := range cfg.Server.HostKeys {
+		signer, err := loadKey(keyFile)
 		if err != nil {
+			return err
+		}
+		cfg.parsedHostKeys = append(cfg.parsedHostKeys, signer)
+	}
+	return nil
+}
+
+func (cfg *config) setupSSHConfig() error {
+	sshConfig := &ssh.ServerConfig{
+		Config: ssh.Config{
+			RekeyThreshold: cfg.SSHProto.RekeyThreshold,
+			KeyExchanges:   cfg.SSHProto.KeyExchanges,
+			Ciphers:        cfg.SSHProto.Ciphers,
+			MACs:           cfg.SSHProto.MACs,
+		},
+		NoClientAuth:                cfg.Auth.NoAuth,
+		MaxAuthTries:                cfg.Auth.MaxTries,
+		PasswordCallback:            cfg.getPasswordCallback(),
+		PublicKeyCallback:           cfg.getPublicKeyCallback(),
+		KeyboardInteractiveCallback: cfg.getKeyboardInteractiveCallback(),
+		AuthLogCallback:             cfg.getAuthLogCallback(),
+		ServerVersion:               cfg.SSHProto.Version,
+		BannerCallback:              cfg.getBannerCallback(),
+	}
+	if err := cfg.parseHostKeys(); err != nil {
+		return err
+	}
+	for _, key := range cfg.parsedHostKeys {
+		sshConfig.AddHostKey(key)
+	}
+	cfg.sshConfig = sshConfig
+	return nil
+}
+
+func (cfg *config) setupLogging() error {
+	if cfg.logFileHandle != nil {
+		cfg.logFileHandle.Close()
+	}
+	if cfg.Logging.File != "" {
+		logFile, err := os.OpenFile(cfg.Logging.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		log.SetOutput(logFile)
+		cfg.logFileHandle = logFile
+	} else {
+		log.SetOutput(os.Stdout)
+		cfg.logFileHandle = nil
+	}
+	if !cfg.Logging.JSON && cfg.Logging.Timestamps {
+		log.SetFlags(log.LstdFlags)
+	} else {
+		log.SetFlags(0)
+	}
+	return nil
+}
+
+func getConfig(configString string, dataDir string) (*config, error) {
+	cfg := getDefaultConfig()
+
+	if err := yaml.UnmarshalStrict([]byte(configString), cfg); err != nil {
+		return nil, err
+	}
+
+	if len(cfg.Server.HostKeys) == 0 {
+		infoLogger.Printf("No host keys configured, using keys at %q", dataDir)
+		if err := cfg.setDefaultHostKeys(dataDir, []keySignature{rsa_key, ecdsa_key, ed25519_key}); err != nil {
 			return nil, err
 		}
 	}
-	if err := yaml.UnmarshalStrict(configBytes, result); err != nil {
+
+	if err := cfg.setupSSHConfig(); err != nil {
 		return nil, err
 	}
-	if result.Banner != "" && !strings.HasSuffix(result.Banner, "\n") {
-		result.Banner = fmt.Sprintf("%v\n", result.Banner)
-	}
-	result.Banner = strings.ReplaceAll(result.Banner, "\n", "\r\n")
-
-	if len(result.HostKeys) == 0 {
-		log.Println("No host keys configured, using keys at", dataDir)
-
-		for _, key := range []struct {
-			keyType  hostKeyType
-			filename string
-		}{
-			{keyType: rsa_key, filename: "host_rsa_key"},
-			{keyType: ecdsa_key, filename: "host_ecdsa_key"},
-			{keyType: ed25519_key, filename: "host_ed25519_key"},
-		} {
-			keyFileName := path.Join(dataDir, key.filename)
-			if err := generateKey(keyFileName, key.keyType); err != nil {
-				return nil, err
-			}
-			result.HostKeys = append(result.HostKeys, keyFileName)
-		}
+	if err := cfg.setupLogging(); err != nil {
+		return nil, err
 	}
 
-	return result, nil
+	return cfg, nil
 }

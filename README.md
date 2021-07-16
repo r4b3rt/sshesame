@@ -4,130 +4,47 @@ An easy to set up and use SSH honeypot, a fake SSH server that lets anyone in an
 
 `sshesame` accepts and logs SSH connections and activity (channels, requests), without doing anything on the host (e.g. executing commands, making network requests).
 
-[![asciicast](https://asciinema.org/a/MfxQ5ZD4ZcO0xTaSsrElFc9zL.svg)](https://asciinema.org/a/MfxQ5ZD4ZcO0xTaSsrElFc9zL)
+[![asciicast](https://asciinema.org/a/VSqzZi1oPA0FhQDyqht22iA6k.svg)](https://asciinema.org/a/VSqzZi1oPA0FhQDyqht22iA6k)
 
-## Installation
+## Installation and usage
 
 ### From source
 
 ```
 go get github.com/jaksi/sshesame
+sshesame [-config sshesame.yaml] [-data_dir /etc/sshesame]
 ```
 
-## Usage
+### Docker
+
+Images are automatically published to [GitHub Packages](https://github.com/jaksi/sshesame/pkgs/container/sshesame).
 
 ```
-sshesame [-config sshesame.yaml]
+docker run -it --rm -p 127.0.0.1:2022:2022 -v sshesame-data:/data [-v $PWD/sshesame.yaml:/config.yaml] ghcr.io/jaksi/sshesame:master
 ```
 
 ### Configuration
 
 A configuration file can optionally be passed using the `-config` flag.
-Without using one, sane defaults will be used and RSA, ECDSA and Ed25519 host keys will be generated and stored.
+Without specifying one, sane defaults will be used and RSA, ECDSA and Ed25519 host keys will be generated and stored in the directory specified in the `-data_dir` flag.
 
 A [sample configuration file](sshesame.yaml) with explanations for the configuration options is included.
 A [minimal configuration file](openssh.yaml) which tries to mimic an OpenSSH server is also included.
 
-Debug and error logs are written to standard error. Session (activity) logs by default are written to standard out, unless the `logfile` config option is set.
+Debug and error logs are written to standard error. Activity logs by default are written to standard out, unless the `logging.file` config option is set.
 
-## Annotated sample output
-
-### TCP connection
+## Sample output
 
 ```
-INFO[0002] Connection accepted
-  remote_address=[...]
-```
-
-### Authentication
-
-#### None (no password or public key), denied
-
-```
-INFO[0002] Client attempted to authenticate
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" method=none
-  remote_addr=[...] session_id=[...] success=false user=jaksi
-```
-
-#### Public key, denied
-
-```
-INFO[0002] Public key authentication attempted
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2"
-  public_key_fingerprint=[...] remote_addr=[...] session_id=[...] success=false
-  user=jaksi
-INFO[0002] Client attempted to authenticate
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" method=publickey
-  remote_addr=[...] session_id=[...] success=false user=jaksi
-```
-
-#### Password, accepted
-
-```
-INFO[0005] Password authentication attempted
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" password=hunter2
-  remote_addr=[...] session_id=[...] success=true user=jaksi
-INFO[0005] Client attempted to authenticate
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" method=password
-  remote_addr=[...] session_id=[...] success=true user=jaksi
-INFO[0005] SSH connection established
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  session_id=[...] user=jaksi
-```
-
-#### Session channel for a shell
-
-```
-INFO[0005] New channel requested
-  accepted=true channel_extra_data= channel_id=0 channel_type=session
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  session_id=[...] user=jaksi
-INFO[0005] Channel request received
-  accepted=true channel_id=0
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  request_payload="Term: xterm-256color, Size: 120x30 (0x0 px), Modes: [...]"
-  request_type=pty-req request_want_reply=true session_id=[...] user=jaksi
-INFO[0005] Channel request received
-  accepted=true channel_id=0
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  request_payload="LANG=C.UTF-8" request_type=env request_want_reply=false
-  session_id=[...] user=jaksi
-INFO[0005] Channel request received
-  accepted=true channel_id=0
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  request_payload= request_type=shell request_want_reply=true session_id=[...]
-  user=jaksi
-INFO[0007] Channel input received
-  channel_id=0 client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2"
-  input="cat /etc/passwd" remote_addr=[...] session_id=[...] user=jaksi
-INFO[0015] Channel closed
-  channel_id=0 client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2"
-  remote_addr=[...] session_id=[...] user=jaksi
-```
-
-#### TCP/IP channel  (`ssh [...] -L 8080:github.com:80`)
-
-```
-INFO[0013] New channel requested
-  accepted=true channel_extra_data="127.0.0.1:53288 -> github.com:80"
-  channel_id=1 channel_type=direct-tcpip
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  session_id=[...] user=jaksi
-INFO[0013] Channel input received
-  channel_id=1 client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2"
-  input="GET / HTTP/1.1\r\nHost: github.com\r\n\r\n" remote_addr=[...]
-  session_id=[...] user=jaksi
-INFO[0013] Channel closed
-  channel_id=1 client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2"
-  remote_addr=[...] session_id=[...] user=jaksi
-```
-
-#### Connection closed
-
-```
-INFO[0015] SSH connection closed
-  client_version="SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.2" remote_addr=[...]
-  session_id=[...] user=jaksi
-INFO[0015] Connection closed
-  remote_address=[...]
+2021/07/04 00:37:05 [127.0.0.1:64515] authentication for user "jaksi" without credentials rejected
+2021/07/04 00:37:05 [127.0.0.1:64515] authentication for user "jaksi" with public key "SHA256:uUdTmvEHN6kCAoE4RJWsxr8+fGTGhCpAhBaWgmMVqNk" rejected
+2021/07/04 00:37:07 [127.0.0.1:64515] authentication for user "jaksi" with password "hunter2" accepted
+2021/07/04 00:37:07 [127.0.0.1:64515] connection with client version "SSH-2.0-OpenSSH_8.1" established
+2021/07/04 00:37:07 [127.0.0.1:64515] [channel 1] session requested
+2021/07/04 00:37:07 [127.0.0.1:64515] [channel 1] PTY using terminal "xterm-256color" (size 158x48) requested
+2021/07/04 00:37:07 [127.0.0.1:64515] [channel 1] environment variable "LANG" with value "en_IE.UTF-8" requested
+2021/07/04 00:37:07 [127.0.0.1:64515] [channel 1] shell requested
+2021/07/04 00:37:16 [127.0.0.1:64515] [channel 1] input: "cat /etc/passwd"
+2021/07/04 00:37:17 [127.0.0.1:64515] [channel 1] closed
+2021/07/04 00:37:17 [127.0.0.1:64515] connection closed
 ```
