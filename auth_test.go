@@ -1,689 +1,494 @@
 package main
 
 import (
-	"bytes"
-	"io"
-	"io/ioutil"
+	"errors"
 	"net"
-	"path"
-	"regexp"
+	"reflect"
 	"testing"
-
-	"github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh"
 )
 
-func TestNoAuthDisabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
-	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PasswordAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test"})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+type mockConnContext struct{}
+
+func (context mockConnContext) User() string {
+	return "root"
+}
+
+func (context mockConnContext) SessionID() []byte {
+	return []byte("somesession")
+}
+
+func (context mockConnContext) ClientVersion() []byte {
+	return []byte("SSH-2.0-testclient")
+}
+
+func (context mockConnContext) ServerVersion() []byte {
+	return []byte("SSH-2.0-testserver")
+}
+
+func (context mockConnContext) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
+}
+
+func (context mockConnContext) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2022}
+}
+
+func TestAuthLogUninteresting(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.NoAuth = false
+	callback := cfg.getAuthLogCallback()
+	logBuffer := setupLogBuffer(t, cfg)
+	callback(mockConnContext{}, "password", nil)
+	logs := logBuffer.String()
+	expectedLogs := ``
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
-func TestNoAuthEnabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestNoAuthFail(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.NoAuth = false
+	callback := cfg.getAuthLogCallback()
+	logBuffer := setupLogBuffer(t, cfg)
+	callback(mockConnContext{}, "none", errors.New(""))
+	logs := logBuffer.String()
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" without credentials rejected
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}, NoClientAuth: true}
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test"})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+}
+
+func TestNoAuthSuccess(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.NoAuth = false
+	callback := cfg.getAuthLogCallback()
+	logBuffer := setupLogBuffer(t, cfg)
+	callback(mockConnContext{}, "none", nil)
+	logs := logBuffer.String()
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" without credentials accepted
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
 func TestPasswordDisabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
-	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PublicKeyAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.Password("hunter2")}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	cfg := &config{}
+	cfg.Auth.PasswordAuth.Enabled = false
+	callback := cfg.getPasswordCallback()
+	if callback != nil {
+		t.Errorf("callback=%p, want nil", callback)
 	}
 }
 
-func TestPasswordEnabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestPasswordFail(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.PasswordAuth.Enabled = true
+	cfg.Auth.PasswordAuth.Accepted = false
+	callback := cfg.getPasswordCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PasswordAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, []byte("hunter2"))
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
 	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.Password("hunter2")}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Password authentication attempted" client_version=SSH-2.0-Go password=hunter2 remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=password remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with password "hunter2" rejected
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
-func TestPasswordAccepted(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestPasswordSuccess(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.PasswordAuth.Enabled = true
+	cfg.Auth.PasswordAuth.Accepted = true
+	callback := cfg.getPasswordCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PasswordAuth.Enabled = true
-	cfg.PasswordAuth.Accepted = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, []byte("hunter2"))
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with password "hunter2" accepted
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestPasswordFailJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.PasswordAuth.Enabled = true
+	cfg.Auth.PasswordAuth.Accepted = false
+	callback := cfg.getPasswordCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, []byte("hunter2"))
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
+	}
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"password_auth","event":{"user":"root","accepted":false,"password":"hunter2"}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestPasswordSuccessJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.PasswordAuth.Enabled = true
+	cfg.Auth.PasswordAuth.Accepted = true
+	callback := cfg.getPasswordCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, []byte("hunter2"))
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.Password("hunter2")}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
 	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Password authentication attempted" client_version=SSH-2.0-Go password=hunter2 remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=password remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"password_auth","event":{"user":"root","accepted":true,"password":"hunter2"}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
 func TestPublicKeyDisabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
-	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PasswordAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	keyBytes, err := ioutil.ReadFile(hostKeyFileName)
-	if err != nil {
-		t.Fatalf("Failed to read host key: %v", err)
-	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		t.Fatalf("Failed to parse host key: %v", err)
-	}
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	cfg := &config{}
+	cfg.Auth.PublicKeyAuth.Enabled = false
+	callback := cfg.getPublicKeyCallback()
+	if callback != nil {
+		t.Errorf("callback=%p, want nil", callback)
 	}
 }
 
-func TestPublicKeyEnabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestPublicKeyFail(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.PublicKeyAuth.Enabled = true
+	cfg.Auth.PublicKeyAuth.Accepted = false
+	callback := cfg.getPublicKeyCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PublicKeyAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, mockPublicKey{})
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
 	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	keyBytes, err := ioutil.ReadFile(hostKeyFileName)
-	if err != nil {
-		t.Fatalf("Failed to read host key: %v", err)
-	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		t.Fatalf("Failed to parse host key: %v", err)
-	}
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Public key authentication attempted" client_version=SSH-2.0-Go public_key_fingerprint="SHA256:[^"]+" remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=publickey remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with public key "SHA256:9faRaLujz6HiqA3/g5tI2zbfNvqHbBzZ19UI86swh0Q" rejected
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
-func TestPublicKeyAccepted(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestPublicKeySuccess(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.PublicKeyAuth.Enabled = true
+	cfg.Auth.PublicKeyAuth.Accepted = true
+	callback := cfg.getPublicKeyCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PublicKeyAuth.Enabled = true
-	cfg.PublicKeyAuth.Accepted = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, mockPublicKey{})
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with public key "SHA256:9faRaLujz6HiqA3/g5tI2zbfNvqHbBzZ19UI86swh0Q" accepted
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestPublicKeyFailJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.PublicKeyAuth.Enabled = true
+	cfg.Auth.PublicKeyAuth.Accepted = false
+	callback := cfg.getPublicKeyCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, mockPublicKey{})
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
+	}
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"public_key_auth","event":{"user":"root","accepted":false,"public_key":"SHA256:9faRaLujz6HiqA3/g5tI2zbfNvqHbBzZ19UI86swh0Q"}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestPublicKeySuccessJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.PublicKeyAuth.Enabled = true
+	cfg.Auth.PublicKeyAuth.Accepted = true
+	callback := cfg.getPublicKeyCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, mockPublicKey{})
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	keyBytes, err := ioutil.ReadFile(hostKeyFileName)
-	if err != nil {
-		t.Fatalf("Failed to read host key: %v", err)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
 	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		t.Fatalf("Failed to parse host key: %v", err)
-	}
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Public key authentication attempted" client_version=SSH-2.0-Go public_key_fingerprint="SHA256:[^"]+" remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=publickey remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"public_key_auth","event":{"user":"root","accepted":true,"public_key":"SHA256:9faRaLujz6HiqA3/g5tI2zbfNvqHbBzZ19UI86swh0Q"}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
 func TestKeyboardInteractiveDisabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+	cfg := &config{}
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = false
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.PasswordAuth.Enabled = true
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
-			return []string{"answer1", "answer2"}, nil
-		})}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback != nil {
+		t.Errorf("callback=%p, want nil", callback)
 	}
 }
 
-func TestKeyboardInteractiveEnabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestKeyboardInteractiveError(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = true
+	cfg.Auth.KeyboardInteractiveAuth.Accepted = false
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.KeyboardInteractiveAuth.Enabled = true
-	cfg.KeyboardInteractiveAuth.Instruction = "instruction"
-	cfg.KeyboardInteractiveAuth.Questions = make([]struct {
-		Text string
-		Echo bool
-	}, 2)
-	cfg.KeyboardInteractiveAuth.Questions[0].Text = "question1"
-	cfg.KeyboardInteractiveAuth.Questions[0].Echo = true
-	cfg.KeyboardInteractiveAuth.Questions[1].Text = "question2"
-	cfg.KeyboardInteractiveAuth.Questions[1].Echo = false
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
-			return []string{"answer1", "answer2"}, nil
-		})}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+		if user != "root" {
+			t.Errorf("user=%v, want root", user)
 		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
+		if instruction != "inst" {
+			t.Errorf("instruction=%v, want inst", instruction)
+		}
+		if !reflect.DeepEqual(questions, []string{"q1", "q2"}) {
+			t.Errorf("questions=%v, want [q1, q2]", questions)
+		}
+		if !reflect.DeepEqual(echos, []bool{true, false}) {
+			t.Errorf("echos=%v, want [true, false]", echos)
+		}
+		return nil, errors.New("")
+	})
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
 	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Keyboard interactive authentication attempted" answers="answer1, answer2" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=keyboard-interactive remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := ``
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
-func TestKeyboardInteractiveAccepted(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestKeyboardInteractiveFail(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = true
+	cfg.Auth.KeyboardInteractiveAuth.Accepted = false
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}}
-	cfg.KeyboardInteractiveAuth.Enabled = true
-	cfg.KeyboardInteractiveAuth.Accepted = true
-	cfg.KeyboardInteractiveAuth.Instruction = "instruction"
-	cfg.KeyboardInteractiveAuth.Questions = make([]struct {
-		Text string
-		Echo bool
-	}, 2)
-	cfg.KeyboardInteractiveAuth.Questions[0].Text = "question1"
-	cfg.KeyboardInteractiveAuth.Questions[0].Echo = true
-	cfg.KeyboardInteractiveAuth.Questions[1].Text = "question2"
-	cfg.KeyboardInteractiveAuth.Questions[1].Echo = false
-	sshServerConfig, err := cfg.createSSHServerConfig()
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+		return []string{"a1", "a2"}, nil
+	})
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
+	}
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with keyboard interactive answers ["a1" "a2"] rejected
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestKeyboardInteractiveSuccess(t *testing.T) {
+	cfg := &config{}
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = true
+	cfg.Auth.KeyboardInteractiveAuth.Accepted = true
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
+	}
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+		return []string{"a1", "a2"}, nil
+	})
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `[127.0.0.1:1234] authentication for user "root" with keyboard interactive answers ["a1" "a2"] accepted
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestKeyboardInteractiveFailJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = true
+	cfg.Auth.KeyboardInteractiveAuth.Accepted = false
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
+	}
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+		return []string{"a1", "a2"}, nil
+	})
+	logs := logBuffer.String()
+	if err == nil {
+		t.Errorf("err=nil, want an error")
+	}
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
+	}
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"keyboard_interactive_auth","event":{"user":"root","accepted":false,"answers":["a1","a2"]}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
+	}
+}
+
+func TestKeyboardInteractiveSuccessJSON(t *testing.T) {
+	cfg := &config{}
+	cfg.Logging.JSON = true
+	cfg.Auth.KeyboardInteractiveAuth.Enabled = true
+	cfg.Auth.KeyboardInteractiveAuth.Accepted = true
+	cfg.Auth.KeyboardInteractiveAuth.Instruction = "inst"
+	cfg.Auth.KeyboardInteractiveAuth.Questions = []keyboardInteractiveAuthQuestion{
+		{"q1", true},
+		{"q2", false},
+	}
+	callback := cfg.getKeyboardInteractiveCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
+	}
+	logBuffer := setupLogBuffer(t, cfg)
+	permissions, err := callback(mockConnContext{}, func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+		return []string{"a1", "a2"}, nil
+	})
+	logs := logBuffer.String()
 	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
+		t.Errorf("err=%v, want nil", err)
 	}
-	defer listener.Close()
-	clientChan := make(chan interface{})
-	go func() {
-		defer func() { clientChan <- nil }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", Auth: []ssh.AuthMethod{ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
-			return []string{"answer1", "answer2"}, nil
-		})}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		defer clientConn.Close()
-	}()
-	defer func() { <-clientChan }()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
+	if permissions != nil {
+		t.Errorf("permissions=%v, want nil", permissions)
 	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=false user=test
-level=info msg="Keyboard interactive authentication attempted" answers="answer1, answer2" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=keyboard-interactive remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	expectedLogs := `{"source":"127.0.0.1:1234","event_type":"keyboard_interactive_auth","event":{"user":"root","accepted":true,"answers":["a1","a2"]}}
+`
+	if logs != expectedLogs {
+		t.Errorf("logs=%v, want %v", string(logs), expectedLogs)
 	}
 }
 
 func TestBannerDisabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
-	}
-	cfg := config{HostKeys: []string{hostKeyFileName}, NoClientAuth: true}
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan bool)
-	go func() {
-		bannerReceived := false
-		defer func() { clientChan <- bannerReceived }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", BannerCallback: func(message string) error {
-			bannerReceived = true
-			return nil
-		}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		t.Log(bannerReceived)
-		defer clientConn.Close()
-	}()
-	defer func() {
-		if <-clientChan {
-			t.Fatalf("Client received a banner, should not have")
-		}
-	}()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	cfg := &config{}
+	cfg.SSHProto.Banner = ""
+	callback := cfg.getBannerCallback()
+	if callback != nil {
+		t.Errorf("callback=%p, want nil", callback)
 	}
 }
 
-func TestBannerEnabled(t *testing.T) {
-	hostKeyFileName := path.Join(t.TempDir(), "rsa.key")
-	if err := generateKey(hostKeyFileName, rsa_key); err != nil {
-		t.Fatalf("Failed to generate RSA key: %v", err)
+func TestBanner(t *testing.T) {
+	cfg := &config{}
+	cfg.SSHProto.Banner = "Lorem\nIpsum\r\nDolor\n\nSit Amet"
+	callback := cfg.getBannerCallback()
+	if callback == nil {
+		t.Fatalf("callback=nil, want a function")
 	}
-	cfg := config{HostKeys: []string{hostKeyFileName}, NoClientAuth: true, Banner: "yo"}
-	sshServerConfig, err := cfg.createSSHServerConfig()
-	if err != nil {
-		t.Fatalf("Failed to create SSH server config: %v", err)
-	}
-	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
-	var logBuffer bytes.Buffer
-	logrus.SetOutput(&logBuffer)
-	listener, err := net.Listen("tcp", "127.0.0.1:2022")
-	if err != nil {
-		t.Fatalf("Failet to listen: %v", err)
-	}
-	defer listener.Close()
-	clientChan := make(chan bool)
-	go func() {
-		bannerReceived := false
-		defer func() { clientChan <- bannerReceived }()
-		clientConn, err := ssh.Dial("tcp", "127.0.0.1:2022", &ssh.ClientConfig{HostKeyCallback: ssh.InsecureIgnoreHostKey(), User: "test", BannerCallback: func(message string) error {
-			bannerReceived = true
-			return nil
-		}})
-		if err != nil {
-			t.Logf("Failed to connect: %v", err)
-			return
-		}
-		t.Log(bannerReceived)
-		defer clientConn.Close()
-	}()
-	defer func() {
-		if !<-clientChan {
-			t.Fatalf("Client received a banner, should not have")
-		}
-	}()
-	serverConn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	handleConnection(serverConn, sshServerConfig)
-	logs, err := io.ReadAll(&logBuffer)
-	expectedLogs := regexp.MustCompile(`^level=info msg="Connection accepted" remote_address="127.0.0.1:\d+"
-level=info msg="Client attempted to authenticate" client_version=SSH-2.0-Go method=none remote_addr="127.0.0.1:\d+" session_id=[^ ]+ success=true user=test
-level=info msg="SSH connection established" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="SSH connection closed" client_version=SSH-2.0-Go remote_addr="127.0.0.1:\d+" session_id=[^ ]+ user=test
-level=info msg="Connection closed" remote_address="127.0.0.1:\d+"
-$`)
-	if err != nil || !expectedLogs.Match(logs) {
-		t.Fatalf("io.ReadAll(&logBuffer) = %v, %v, want match %v, nil", string(logs), err, expectedLogs)
+	banner := callback(mockConnContext{})
+	expectedBanner := "Lorem\r\nIpsum\r\nDolor\r\n\r\nSit Amet\r\n"
+	if banner != expectedBanner {
+		t.Errorf("banner=%v, want %v", banner, expectedBanner)
 	}
 }

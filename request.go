@@ -1,253 +1,202 @@
 package main
 
 import (
-	"encoding/base64"
+	"bytes"
+	cryptoRand "crypto/rand"
 	"encoding/binary"
-	"fmt"
-	"log"
-	"math/rand"
-	"net"
-	"strings"
+	"errors"
+	mathRand "math/rand"
 
-	"github.com/sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/crypto/ssh"
 )
 
-type tcpipRequestPayload struct {
+type globalRequestPayload interface {
+	reply(context *connContext) []byte
+	logEntry(context *connContext) logEntry
+}
+
+type globalRequestPayloadParser func(data []byte, context *connContext) (globalRequestPayload, error)
+
+type tcpipRequest struct {
 	Address string
 	Port    uint32
 }
 
-func (payload tcpipRequestPayload) String() string {
-	return net.JoinHostPort(payload.Address, fmt.Sprint(payload.Port))
+func (request tcpipRequest) reply(context *connContext) []byte {
+	if request.Port != 0 {
+		return nil
+	}
+	return ssh.Marshal(struct{ port uint32 }{uint32(mathRand.Intn(65536-1024) + 1024)})
+}
+func (request tcpipRequest) logEntry(context *connContext) logEntry {
+	return tcpipForwardLog{
+		Address: getAddressLog(request.Address, int(request.Port), context.cfg),
+	}
 }
 
-func handleGlobalRequests(requests <-chan *ssh.Request, conn ssh.ConnMetadata) {
-	for request := range requests {
-		var requestPayload interface{}
-		accept := true
-		switch request.Type {
-		case "tcpip-forward":
-			fallthrough
-		case "cancel-tcpip-forward":
-			requestPayload = new(tcpipRequestPayload)
-		default:
-			log.Println("Unsupported global request type", request.Type)
-			accept = false
+type cancelTCPIPRequest struct {
+	Address string
+	Port    uint32
+}
+
+func (request cancelTCPIPRequest) reply(context *connContext) []byte {
+	return nil
+}
+func (request cancelTCPIPRequest) logEntry(context *connContext) logEntry {
+	return cancelTCPIPForwardLog{
+		Address: getAddressLog(request.Address, int(request.Port), context.cfg),
+	}
+}
+
+type noMoreSessionsRequest struct {
+}
+
+func (request noMoreSessionsRequest) reply(context *connContext) []byte {
+	return nil
+}
+func (request noMoreSessionsRequest) logEntry(context *connContext) logEntry {
+	return noMoreSessionsLog{}
+}
+
+type hostKeysProveRequest struct {
+	hostKeyIndices []int
+}
+
+func (request hostKeysProveRequest) reply(context *connContext) []byte {
+	signatures := make([][]byte, len(request.hostKeyIndices))
+	for i, index := range request.hostKeyIndices {
+		signature, err := context.cfg.parsedHostKeys[index].Sign(cryptoRand.Reader, ssh.Marshal(struct {
+			requestType, sessionID, hostKey string
+		}{
+			"hostkeys-prove-00@openssh.com",
+			string(context.SessionID()),
+			string(context.cfg.parsedHostKeys[index].PublicKey().Marshal()),
+		}))
+		if err != nil {
+			warningLogger.Printf("Failed to sign host key: %v", err)
+			return nil
 		}
-		requestPayloadString := ""
-		if requestPayload != nil {
-			if err := ssh.Unmarshal(request.Payload, requestPayload); err != nil {
-				log.Println("Failed to parse request payload", err)
-				continue
+		signatures[i] = ssh.Marshal(signature)
+	}
+	return marshalBytes(signatures)
+}
+func (request hostKeysProveRequest) logEntry(context *connContext) logEntry {
+	hostKeyFiles := make([]string, len(request.hostKeyIndices))
+	for i, index := range request.hostKeyIndices {
+		hostKeyFiles[i] = context.cfg.Server.HostKeys[index]
+	}
+	return hostKeysProveLog{
+		HostKeyFiles: hostKeyFiles,
+	}
+}
+
+var globalRequestPayloads = map[string]globalRequestPayloadParser{
+	"tcpip-forward": func(data []byte, context *connContext) (globalRequestPayload, error) {
+		payload := &tcpipRequest{}
+		if err := ssh.Unmarshal(data, payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+	},
+	"cancel-tcpip-forward": func(data []byte, context *connContext) (globalRequestPayload, error) {
+		payload := &cancelTCPIPRequest{}
+		if err := ssh.Unmarshal(data, payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+	},
+	"no-more-sessions@openssh.com": func(data []byte, context *connContext) (globalRequestPayload, error) {
+		if len(data) != 0 {
+			return nil, errors.New("invalid request payload")
+		}
+		return &noMoreSessionsRequest{}, nil
+	},
+	"hostkeys-prove-00@openssh.com": func(data []byte, context *connContext) (globalRequestPayload, error) {
+		payloadBytes, err := unmarshalBytes(data)
+		if err != nil {
+			return nil, err
+		}
+		hostKeyIndices := make([]int, len(payloadBytes))
+		for i, publicKeyBytes := range payloadBytes {
+			found := false
+			for j, hostKey := range context.cfg.parsedHostKeys {
+				if bytes.Equal(publicKeyBytes, hostKey.PublicKey().Marshal()) {
+					hostKeyIndices[i] = j
+					found = true
+					break
+				}
 			}
-
-			requestPayloadString = fmt.Sprint(requestPayload)
+			if !found {
+				return nil, errors.New("host key not found")
+			}
 		}
-		if requestPayloadString == "" {
-			requestPayloadString = base64.RawStdEncoding.EncodeToString(request.Payload)
-		}
+		return &hostKeysProveRequest{hostKeyIndices}, nil
+	},
+}
 
-		getLogEntry(conn).WithFields(logrus.Fields{
-			"request_payload":    requestPayloadString,
-			"request_type":       request.Type,
-			"request_want_reply": request.WantReply,
-			"accepted":           accept,
-		}).Infoln("Global request received")
+var (
+	globalRequestsMetric = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sshesame_global_requests_total",
+		Help: "Total number of global requests",
+	}, []string{"type"})
+)
 
+func handleGlobalRequest(request *ssh.Request, context *connContext) error {
+	parser := globalRequestPayloads[request.Type]
+	if parser == nil {
+		globalRequestsMetric.WithLabelValues("unknown").Inc()
+		warningLogger.Printf("Unsupported global request type %v", request.Type)
 		if request.WantReply {
-			var response []byte
-			if request.Type == "tcpip-forward" && requestPayload.(*tcpipRequestPayload).Port == 0 {
-				response = ssh.Marshal(struct{ port uint32 }{uint32(rand.Intn(65536-1024) + 1024)})
+			if err := request.Reply(false, nil); err != nil {
+				return err
 			}
-			if err := request.Reply(accept, response); err != nil {
-				log.Println("Failed to reply to global request:", err)
-				continue
-			}
+		}
+		return nil
+	}
+	globalRequestsMetric.WithLabelValues(request.Type).Inc()
+	payload, err := parser(request.Payload, context)
+	if err != nil {
+		return err
+	}
+	switch payload.(type) {
+	case *noMoreSessionsRequest:
+		context.noMoreSessions = true
+	}
+	if request.WantReply {
+		if err := request.Reply(true, payload.reply(context)); err != nil {
+			return err
 		}
 	}
+	context.logEvent(payload.logEntry(context))
+	return nil
 }
 
-type ptyRequestPayload struct {
-	Term                                   string
-	Width, Height, PixelWidth, PixelHeight uint32
-	Modes                                  string
-}
-
-func (payload ptyRequestPayload) String() string {
-	terminalModes := []string{}
-	modeBytes := []byte(payload.Modes)
-	for i := 0; i < len(modeBytes); i += 5 {
-		opcode := modeBytes[i]
-		if opcode >= 160 {
-			break
-		}
-		argument := binary.BigEndian.Uint32(modeBytes[i+1 : i+5])
-		opcodeString, ok := map[uint8]string{
-			0:   "TTY_OP_END",
-			1:   "VINTR",
-			2:   "VQUIT",
-			3:   "VERASE",
-			4:   "VKILL",
-			5:   "VEOF",
-			6:   "VEOL",
-			7:   "VEOL2",
-			8:   "VSTART",
-			9:   "VSTOP",
-			10:  "VSUSP",
-			11:  "VDSUSP",
-			12:  "VREPRINT",
-			13:  "VWERASE",
-			14:  "VLNEXT",
-			15:  "VFLUSH",
-			16:  "VSWTCH",
-			17:  "VSTATUS",
-			18:  "VDISCARD",
-			30:  "IGNPAR",
-			31:  "PARMRK",
-			32:  "INPCK",
-			33:  "ISTRIP",
-			34:  "INLCR",
-			35:  "IGNCR",
-			36:  "ICRNL",
-			37:  "IUCLC",
-			38:  "IXON",
-			39:  "IXANY",
-			40:  "IXOFF",
-			41:  "IMAXBEL",
-			50:  "ISIG",
-			51:  "ICANON",
-			52:  "XCASE",
-			53:  "ECHO",
-			54:  "ECHOE",
-			55:  "ECHOK",
-			56:  "ECHONL",
-			57:  "NOFLSH",
-			58:  "TOSTOP",
-			59:  "IEXTEN",
-			60:  "ECHOCTL",
-			61:  "ECHOKE",
-			62:  "PENDIN",
-			70:  "OPOST",
-			71:  "OLCUC",
-			72:  "ONLCR",
-			73:  "OCRNL",
-			74:  "ONOCR",
-			75:  "ONLRET",
-			90:  "CS7",
-			91:  "CS8",
-			92:  "PARENB",
-			93:  "PARODD",
-			128: "TTY_OP_ISPEED",
-			129: "TTY_OP_OSPEED",
-		}[opcode]
-		if !ok {
-			opcodeString = fmt.Sprintf("OPCODE_%v", opcode)
-		}
-		terminalModes = append(terminalModes, fmt.Sprintf("%v=%v", opcodeString, argument))
+func marshalBytes(data [][]byte) []byte {
+	var result []byte
+	for _, b := range data {
+		result = append(result, ssh.Marshal(struct{ string }{string(b)})...)
 	}
-	return fmt.Sprintf("Term: %v, Size: %vx%v (%vx%v px), Modes: %v", payload.Term, payload.Width, payload.Height, payload.PixelWidth, payload.PixelHeight, strings.Join(terminalModes, ", "))
+	return result
 }
 
-type x11RequestPayload struct {
-	SingleConnection         bool
-	AuthProtocol, AuthCookie string
-	ScreenNumber             uint32
-}
-
-func (payload x11RequestPayload) String() string {
-	return fmt.Sprintf("Single connection: %v, Auth protocol: %v, Auth cookie: %v, Screen number: %v", payload.SingleConnection, payload.AuthProtocol, payload.AuthCookie, payload.ScreenNumber)
-}
-
-type envRequestPayload struct {
-	Name, Value string
-}
-
-func (payload envRequestPayload) String() string {
-	return fmt.Sprintf("%v=%v", payload.Name, payload.Value)
-}
-
-type execRequestPayload struct {
-	Command string
-}
-
-func (payload execRequestPayload) String() string {
-	return payload.Command
-}
-
-type subsystemRequestPayload struct {
-	Subsystem string
-}
-
-func (payload subsystemRequestPayload) String() string {
-	return payload.Subsystem
-}
-
-type windowChangeRequestPayload struct {
-	Width, Height, PixelWidth, PixelHeight uint32
-}
-
-func (payload windowChangeRequestPayload) String() string {
-	return fmt.Sprintf("%vx%v (%vx%v px)", payload.Width, payload.Height, payload.PixelWidth, payload.PixelHeight)
-}
-
-type signalRequestPayload struct {
-	Signal string
-}
-
-func (payload signalRequestPayload) String() string {
-	return payload.Signal
-}
-
-func handleChannelRequests(requests <-chan *ssh.Request, conn channelMetadata) {
-	for request := range requests {
-		var requestPayload interface{}
-		accept := true
-		switch request.Type {
-		case "pty-req":
-			requestPayload = new(ptyRequestPayload)
-		case "x11-req":
-			requestPayload = new(x11RequestPayload)
-		case "env":
-			requestPayload = new(envRequestPayload)
-		case "shell":
-		case "exec":
-			requestPayload = new(execRequestPayload)
-		case "subsystem":
-			requestPayload = new(subsystemRequestPayload)
-		case "window-change":
-			requestPayload = new(windowChangeRequestPayload)
-		case "signal":
-			requestPayload = new(signalRequestPayload)
-		default:
-			log.Println("Unsupported channel request type", request.Type)
-			accept = false
+func unmarshalBytes(data []byte) ([][]byte, error) {
+	var result [][]byte
+	for len(data) > 0 {
+		if len(data) < 4 {
+			return nil, errors.New("invalid request payload")
 		}
-		requestPayloadString := ""
-		if requestPayload != nil {
-			if err := ssh.Unmarshal(request.Payload, requestPayload); err != nil {
-				log.Println("Failed to parse request payload", err)
-				continue
-			}
-
-			requestPayloadString = fmt.Sprint(requestPayload)
+		length := binary.BigEndian.Uint32(data[:4])
+		if len(data) < 4+int(length) {
+			return nil, errors.New("invalid request payload")
 		}
-		if requestPayloadString == "" {
-			requestPayloadString = base64.RawStdEncoding.EncodeToString(request.Payload)
+		var s struct{ S string }
+		if err := ssh.Unmarshal(data[:4+length], &s); err != nil {
+			return nil, err
 		}
-
-		conn.getLogEntry().WithFields(logrus.Fields{
-			"request_payload":    requestPayloadString,
-			"request_type":       request.Type,
-			"request_want_reply": request.WantReply,
-			"accepted":           accept,
-		}).Infoln("Channel request received")
-
-		if request.WantReply {
-			if err := request.Reply(accept, nil); err != nil {
-				log.Println("Failed to reply to channel request:", err)
-				continue
-			}
-		}
+		result = append(result, []byte(s.S))
+		data = data[4+length:]
 	}
+	return result, nil
 }
